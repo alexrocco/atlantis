@@ -80,7 +80,7 @@ github.com/dgrijalva/jwt-go
 # github.com/docker/docker v0.0.0-20180620051407-e2593239d949
 ## explicit
 github.com/docker/docker/pkg/fileutils
-# github.com/elazarl/go-bindata-assetfs v1.0.0
+# github.com/elazarl/go-bindata-assetfs v1.0.1
 ## explicit
 github.com/elazarl/go-bindata-assetfs
 # github.com/fatih/color v1.7.0
