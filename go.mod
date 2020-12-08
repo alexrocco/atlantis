@@ -3,7 +3,7 @@ module github.com/runatlantis/atlantis
 go 1.14
 
 require (
-	github.com/Laisky/graphql v1.0.4
+	github.com/Laisky/graphql v1.0.5
 	github.com/Masterminds/semver v1.4.2 // indirect
 	github.com/Masterminds/sprig v2.15.0+incompatible
 	github.com/agext/levenshtein v1.2.3 // indirect

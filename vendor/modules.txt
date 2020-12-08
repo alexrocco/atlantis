@@ -6,7 +6,7 @@ cloud.google.com/go/internal/optional
 cloud.google.com/go/internal/trace
 cloud.google.com/go/internal/version
 cloud.google.com/go/storage
-# github.com/Laisky/graphql v1.0.4
+# github.com/Laisky/graphql v1.0.5
 ## explicit
 github.com/Laisky/graphql
 github.com/Laisky/graphql/ident
