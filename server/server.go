@@ -20,12 +20,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -62,6 +64,8 @@ const (
 	// route. ex:
 	//   mux.Router.Get(LockViewRouteName).URL(LockViewRouteIDQueryParam, "my id")
 	LockViewRouteIDQueryParam = "id"
+	// TfOutputViewRouteName is the name for the route in mux.Router for the tf output view.
+	TfOutputViewRouteName = "tf-output-detail"
 )
 
 // Server runs the Atlantis web server.
@@ -74,10 +78,12 @@ type Server struct {
 	CommandRunner                 *events.DefaultCommandRunner
 	Logger                        *logging.SimpleLogger
 	Locker                        locking.Locker
+	TfOutput            	      terraform.OutputHelper
 	EventsController              *EventsController
 	GithubAppController           *GithubAppController
 	LocksController               *LocksController
 	StatusController              *StatusController
+	TfOutputsController           *TfOutputController
 	IndexTemplate                 TemplateWriter
 	LockDetailTemplate            TemplateWriter
 	SSLCertFile                   string
@@ -242,7 +248,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		config.DefaultTFVersionFlag,
 		userConfig.TFDownloadURL,
 		&terraform.DefaultDownloader{},
-		true)
+		true,
+		userConfig.OutputCmdDir,
+	)
 	// The flag.Lookup call is to detect if we're running in a unit test. If we
 	// are, then we don't error out because we don't have/want terraform
 	// installed on our CI system where the unit tests run.
@@ -316,6 +324,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		AtlantisURL:               parsedURL,
 		LockViewRouteIDQueryParam: LockViewRouteIDQueryParam,
 		LockViewRouteName:         LockViewRouteName,
+		TfOutputViewRouteName:     TfOutputViewRouteName,
 		Underlying:                underlyingRouter,
 	}
 	pullClosedExecutor := &events.PullClosedExecutor{
@@ -474,6 +483,23 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		GithubOrg:           userConfig.GithubOrg,
 	}
 
+	var tfOutput terraform.OutputHelper
+	if len(userConfig.OutputCmdDir) > 0 {
+		tfOutput, err = terraform.NewOutputHelper(userConfig.OutputCmdDir)
+		if err != nil {
+			return nil, errors.Wrap(err, "can't create terraform output service")
+		}
+	}
+
+	tfOutputsController := &TfOutputController{
+		AtlantisVersion:        config.AtlantisVersion,
+		AtlantisURL:            parsedURL,
+		Log:                    logger,
+		TfOutputHelper:         tfOutput,
+		WsUpgrader:             websocket.Upgrader{},
+		TfOutputDetailTemplate: tfOutputTemplate,
+	}
+
 	return &Server{
 		AtlantisVersion:               config.AtlantisVersion,
 		AtlantisURL:                   parsedURL,
@@ -483,12 +509,14 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		CommandRunner:                 commandRunner,
 		Logger:                        logger,
 		Locker:                        lockingClient,
+		TfOutput:            	       tfOutput,
 		EventsController:              eventsController,
 		GithubAppController:           githubAppController,
 		LocksController:               locksController,
 		StatusController:              statusController,
 		IndexTemplate:                 indexTemplate,
 		LockDetailTemplate:            lockTemplate,
+		TfOutputsController: 	       tfOutputsController,
 		SSLKeyFile:                    userConfig.SSLKeyFile,
 		SSLCertFile:                   userConfig.SSLCertFile,
 		Drainer:                       drainer,
@@ -509,6 +537,23 @@ func (s *Server) Start() error {
 	s.Router.HandleFunc("/locks", s.LocksController.DeleteLock).Methods("DELETE").Queries("id", "{id:.*}")
 	s.Router.HandleFunc("/lock", s.LocksController.GetLock).Methods("GET").
 		Queries(LockViewRouteIDQueryParam, fmt.Sprintf("{%s}", LockViewRouteIDQueryParam)).Name(LockViewRouteName)
+
+	// Tf output handlers
+	// Tf output detail view
+	s.Router.HandleFunc("/tf-output", s.TfOutputsController.GetTfOutputDetail).Methods("GET").
+		Queries(func() []string {
+			var queries []string
+			// Format the map with the queries to mux.Router format
+			for query, validation := range s.TfOutputsController.GetQueries() {
+				queries = append(queries, query, validation)
+			}
+
+			return queries
+		}()...).Name(TfOutputViewRouteName)
+
+	// Tf output websocket endpoint
+	s.Router.HandleFunc(TfOutputWbSocketPath, s.TfOutputsController.GetTfOutputWebsocket)
+
 	n := negroni.New(&negroni.Recovery{
 		Logger:     log.New(os.Stdout, "", log.LstdFlags),
 		PrintStack: false,
@@ -592,11 +637,58 @@ func (s *Server) Index(w http.ResponseWriter, _ *http.Request) {
 		})
 	}
 
+	// Check if terraform output was configured before listing all the files.
+	var tfOutputs []TfOutputIndexData
+	if s.TfOutput != nil {
+		outputs, err := s.TfOutput.List()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Could not retrieve terraform outputs: %s", err)
+			return
+		}
+
+		for _, tfOutput := range outputs {
+			createdAt := tfOutput.CreatedAt.Format("20060102150405")
+			createdAtFormatter := tfOutput.CreatedAt.Format("02-01-2006 15:04:05")
+
+			tfOutputDetailPath, err := s.Router.Get(TfOutputViewRouteName).
+				URL(
+					TfOutputQueryCreatedAt, url.QueryEscape(createdAt),
+					TfOutputQueryCreatedAtFormatted, url.QueryEscape(createdAtFormatter),
+					TfOutputQueryRepoFullName, url.QueryEscape(tfOutput.FullRepoName),
+					TfOutputQueryPullNum, strconv.Itoa(tfOutput.PullRequestNr),
+					TfOutputQueryHeadCommit, url.QueryEscape(tfOutput.HeadCommit),
+					TfOutputQueryProject, url.QueryEscape(tfOutput.Project),
+					TfOutputQueryWorkspace, url.QueryEscape(tfOutput.Workspace),
+					TfOutputQueryTfCommand, url.QueryEscape(tfOutput.TfCommand),
+				)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "Could not parse tf output detail urls: %v", err)
+				return
+			}
+
+			tfOutputs = append(tfOutputs, TfOutputIndexData{
+				Path:               tfOutputDetailPath.String(),
+				CreatedAt:          createdAt,
+				CreatedAtFormatted: createdAtFormatter,
+				RepoFullName:       tfOutput.FullRepoName,
+				PullNum:            tfOutput.PullRequestNr,
+				HeadCommit:         tfOutput.HeadCommit,
+				Project:            tfOutput.Project,
+				Workspace:          tfOutput.Workspace,
+				TfCommand:          tfOutput.TfCommand,
+			})
+		}
+	}
+
 	//Sort by date - newest to oldest.
 	sort.SliceStable(lockResults, func(i, j int) bool { return lockResults[i].Time.After(lockResults[j].Time) })
+	sort.SliceStable(tfOutputs, func(i, j int) bool { return tfOutputs[i].CreatedAt > tfOutputs[j].CreatedAt })
 
 	err = s.IndexTemplate.Execute(w, IndexData{
 		Locks:           lockResults,
+		TfOutputs:       tfOutputs,
 		AtlantisVersion: s.AtlantisVersion,
 		CleanedBasePath: s.AtlantisURL.Path,
 	})

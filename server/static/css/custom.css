@@ -237,6 +237,11 @@ tbody {
   border: #E74C3C;
   color: #FFFFFF;
 }
+
+.commit {
+  text-transform: lowercase;
+}
+
 .unlock{
   height: 16px;
   margin-top: 12px;
@@ -317,7 +322,7 @@ tbody {
 /* Footer contains the Atlantis version */
 footer {
   font-family: monospace, monospace; font-size: 1.2rem;
-  position: absolute;
+  float: right;
   bottom: 0;
   right: 0;
   color: grey;

@@ -16,7 +16,14 @@ package terraform
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"github.com/hashicorp/go-getter"
+	"github.com/hashicorp/go-version"
+	"github.com/mitchellh/go-homedir"
+	"github.com/pkg/errors"
+	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/logging"
 	"io"
 	"io/ioutil"
 	"os"
@@ -26,12 +33,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-
-	"github.com/hashicorp/go-getter"
-	"github.com/hashicorp/go-version"
-	"github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
-	"github.com/runatlantis/atlantis/server/logging"
 )
 
 //go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_terraform_client.go Client
@@ -40,7 +41,7 @@ type Client interface {
 	// RunCommandWithVersion executes terraform with args in path. If v is nil,
 	// it will use the default Terraform version. workspace is the Terraform
 	// workspace which should be set as an environment variable.
-	RunCommandWithVersion(log *logging.SimpleLogger, path string, args []string, envs map[string]string, v *version.Version, workspace string) (string, error)
+	RunCommandWithVersion(ctx models.ProjectCommandContext, path string, args []string, customEnvVars map[string]string, v *version.Version) (string, error)
 
 	// EnsureVersion makes sure that terraform version `v` is available to use
 	EnsureVersion(log *logging.SimpleLogger, v *version.Version) error
@@ -68,6 +69,12 @@ type DefaultClient struct {
 
 	// usePluginCache determines whether or not to set the TF_PLUGIN_CACHE_DIR env var
 	usePluginCache bool
+
+	// outputCmdDir specify where the tf commands should write its output (stdout and stderr)
+	outputCmdDir string
+
+	// outputHelper deals with the tf file output operations
+	outputHelper FileOutputHelper
 }
 
 //go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_downloader.go Downloader
@@ -111,7 +118,8 @@ func NewClient(
 	defaultVersionFlagName string,
 	tfDownloadURL string,
 	tfDownloader Downloader,
-	usePluginCache bool) (*DefaultClient, error) {
+	usePluginCache bool,
+	outputCmdDir string) (*DefaultClient, error) {
 	var finalDefaultVersion *version.Version
 	var localVersion *version.Version
 	versions := make(map[string]string)
@@ -175,6 +183,21 @@ func NewClient(
 		return nil, errors.Wrapf(err, "unable to create terraform plugin cache directory at %q", terraformPluginCacheDirName)
 	}
 
+	// If outputCmdDir is configured, verify if the outputCmdDir exists
+	if len(outputCmdDir) > 0 {
+		_, err := os.Stat(outputCmdDir)
+		// Create the outputCmdDir if it's not created
+		if os.IsNotExist(err) {
+			if err = os.MkdirAll(outputCmdDir, 0700); err != nil {
+				return nil, errors.Wrapf(err, "can't create terraform output dir at %s", outputCmdDir)
+			}
+		}
+
+		if err != nil {
+			return nil, errors.Wrapf(err, "can't verify terraform output dir at %s", outputCmdDir)
+		}
+	}
+
 	return &DefaultClient{
 		defaultVersion:          finalDefaultVersion,
 		terraformPluginCacheDir: cacheDir,
@@ -184,6 +207,7 @@ func NewClient(
 		versionsLock:            &versionsLock,
 		versions:                versions,
 		usePluginCache:          usePluginCache,
+		outputCmdDir:            outputCmdDir,
 	}, nil
 }
 
@@ -216,24 +240,63 @@ func (c *DefaultClient) EnsureVersion(log *logging.SimpleLogger, v *version.Vers
 }
 
 // See Client.RunCommandWithVersion.
-func (c *DefaultClient) RunCommandWithVersion(log *logging.SimpleLogger, path string, args []string, customEnvVars map[string]string, v *version.Version, workspace string) (string, error) {
-	tfCmd, cmd, err := c.prepCmd(log, v, workspace, path, args)
+func (c *DefaultClient) RunCommandWithVersion(ctx models.ProjectCommandContext, path string, args []string, customEnvVars map[string]string, v *version.Version) (string, error) {
+	tfCmd, cmd, err := c.prepCmd(ctx.Log, v, ctx.Workspace, path, args)
 	if err != nil {
 		return "", err
 	}
+
 	envVars := cmd.Env
 	for key, val := range customEnvVars {
 		envVars = append(envVars, fmt.Sprintf("%s=%s", key, val))
 	}
 	cmd.Env = envVars
-	out, err := cmd.CombinedOutput()
+
+	// Default string writer
+	strBuff := bytes.NewBuffer([]byte{})
+
+	var writer io.Writer
+	writer = strBuff
+
+	// If outputCmdDir configured, create the file to write the output from the command
+	if len(c.outputCmdDir) > 0 {
+		outputFileName := c.outputHelper.CreateFileName(
+			ctx.HeadRepo.FullName,
+			ctx.Pull.Num,
+			ctx.Pull.HeadCommit,
+			ctx.ProjectName,
+			ctx.Workspace,
+			args[0], // Tf command (e.g. plan and apply) is always the first argument.
+		)
+
+		ctx.Log.Debug("terraform output file for project %q and tf command %q, file %q will be created", ctx.ProjectName, args[0], outputFileName)
+
+		outputFilePath := filepath.Join(c.outputCmdDir, outputFileName)
+		// Create the file with read mode
+		outputFile, err := os.OpenFile(outputFilePath, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return "", errors.Wrapf(err, "can't create tf output file %q", outputFilePath)
+		}
+		defer outputFile.Close()
+
+		// Multi writer to handle stdout and stderr in both outputs string and file.
+		writer = io.MultiWriter(strBuff, outputFile)
+	}
+
+	// Set writer in both stds
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+
+	err = cmd.Run()
 	if err != nil {
 		err = errors.Wrapf(err, "running %q in %q", tfCmd, path)
-		log.Err(err.Error())
-		return string(out), err
+		ctx.Log.Err(err.Error())
+		return strBuff.String(), err
 	}
-	log.Info("successfully ran %q in %q", tfCmd, path)
-	return string(out), nil
+
+	ctx.Log.Info("successfully ran %q in %q", tfCmd, path)
+
+	return strBuff.String(), nil
 }
 
 // prepCmd builds a ready to execute command based on the version of terraform

@@ -40,9 +40,23 @@ type LockIndexData struct {
 	TimeFormatted string
 }
 
+// TfOutputIndexData hols de the fields to display the index view for terraform outputs.
+type TfOutputIndexData struct {
+	Path               string
+	CreatedAt          string
+	CreatedAtFormatted string
+	RepoFullName       string
+	PullNum            int
+	HeadCommit         string
+	Project            string
+	Workspace          string
+	TfCommand          string
+}
+
 // IndexData holds the data for rendering the index page
 type IndexData struct {
 	Locks           []LockIndexData
+	TfOutputs       []TfOutputIndexData
 	AtlantisVersion string
 	// CleanedBasePath is the path Atlantis is accessible at externally. If
 	// not using a path-based proxy, this will be an empty string. Never ends
@@ -102,6 +116,19 @@ var indexTemplate = template.Must(template.New("index.html.tmpl").Parse(`
     {{ else }}
     <p class="placeholder">No locks found.</p>
     {{ end }}
+  </section>
+  <br>
+  <div class="navbar-spacer"></div>
+  <section>
+	<p class="title-heading small"><strong>Terraform outputs</strong></p>
+    {{ range .TfOutputs }}
+	<a href="{{.Path}}">
+	  <div class="twelve columns button content lock-row">
+		<div class="list-title">{{.RepoFullName}} <span class="heading-font-size">#{{.PullNum}}</span> <code>{{.Project}}</code> <code>{{.TfCommand}}</code> <code class="commit">{{.HeadCommit}}</code> </div>
+        <div class="list-timestamp"><span class="heading-font-size">{{.CreatedAtFormatted}}</span></div>
+      </div>
+    </a>
+	{{ end }}
   </section>
 </div>
 <footer>
@@ -225,6 +252,111 @@ v{{ .AtlantisVersion }}
           modal.css("display", "none");
       }
   }
+</script>
+</body>
+</html>
+`))
+
+type TfOutputDetailData struct {
+	CreatedAt          string
+	CreatedAtFormatted string
+	RepoFullName       string
+	PullNum            int
+	HeadCommit         string
+	Project            string
+	Workspace          string
+	TfCommand          string
+	// CleanedBasePath is the path Atlantis is accessible at externally. If
+	// not using a path-based proxy, this will be an empty string. Never ends
+	// in a '/' (hence "cleaned").
+	CleanedBasePath string
+	// WebSocketUrl is the URL which the javascript will use to open the web socket connection.
+	WebSocketUrl    string
+}
+
+var tfOutputTemplate = template.Must(template.New("tfoutput.html.tmpl").Parse(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>atlantis</title>
+  <meta name="description" content="">
+  <meta name="author" content="">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="tf-output-data" content="{{.CreatedAt}}|{{.RepoFullName}}|{{.PullNum}}|{{.HeadCommit}}|{{.Project}}|{{.Workspace}}|{{.TfCommand}}">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/normalize.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/skeleton.css">
+  <link rel="stylesheet" href="{{ .CleanedBasePath }}/static/css/custom.css">
+  <link rel="icon" type="image/png" href="{{ .CleanedBasePath }}/static/images/atlantis-icon.png">
+  <script src="{{ .CleanedBasePath }}/static/js/jquery-3.5.1.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <section class="header">
+    <a title="atlantis" href="{{ .CleanedBasePath }}/"><img class="hero" src="{{ .CleanedBasePath }}/static/images/atlantis-icon_512.png"/></a>
+    <p class="title-heading">atlantis</p>
+    </section>
+    <div class="navbar-spacer"></div>
+    <br>
+    <section>
+      <div class="eight columns">
+        <h6><code>Created at</code>: <strong>{{.CreatedAtFormatted}}</strong></h6>
+        <h6><code>Repo</code>: <strong>{{.RepoFullName}}</strong></h6>
+        <h6><code>Pul request</code>: <strong>#{{.PullNum}}</strong></h6>
+        <h6><code>Head commit</code>: <strong>{{.HeadCommit}}</strong></h6>
+        <h6><code>Project</code>: <strong>{{.Project}}</strong></h6>
+        <h6><code>Terraform workspace</code>: <strong>{{.Workspace}}</strong></h6>
+        <h6><code>Terraform command</code>: <strong>{{.TfCommand}}</strong></h6>
+      </div>
+    </section>
+  </div>
+  <div id="output" class="container" style="border: 1px solid; padding-left: 5px; padding-right: 5px; margin-bottom: 20px; min-height: 300px;"></div>
+<script>
+    let output;
+
+    function init() {
+        output = document.getElementById("output");
+        testWebSocket();
+    }
+
+    function testWebSocket() {
+        websocket = new WebSocket({{.WebSocketUrl}});
+        websocket.onopen = function (evt) {
+            onOpen(evt)
+        };
+        websocket.onmessage = function (evt) {
+            onMessage(evt)
+        };
+        websocket.onerror = function (evt) {
+            onError(evt)
+        };
+    }
+
+    function onOpen(evt) {
+        let tfOutputFile = $("meta[name=tf-output-data]")[0].content;
+        websocket.send(tfOutputFile);
+    }
+
+    function onMessage(evt) {
+        writeToScreen(evt.data);
+    }
+
+    function onError(evt) {
+        writeToScreen('<span style="color: red;">ERROR:</span> ' + evt.data);
+    }
+
+    function writeToScreen(message) {
+		// When it's an empty message add an break line
+		if (message.length == 1) {
+			message = "<br />"
+		}
+        var div = document.createElement("div");
+		div.style = "line-height: 1.2;"
+        div.innerHTML = message;
+        output.appendChild(div);
+    }
+
+    window.addEventListener("load", init, false);
 </script>
 </body>
 </html>
