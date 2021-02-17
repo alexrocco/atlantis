@@ -2,15 +2,15 @@ package terraform
 
 import (
 	"fmt"
+	version "github.com/hashicorp/go-version"
+	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/logging"
+	. "github.com/runatlantis/atlantis/testing"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	version "github.com/hashicorp/go-version"
-	"github.com/runatlantis/atlantis/server/logging"
-	. "github.com/runatlantis/atlantis/testing"
 )
 
 // Test that we write the file as expected
@@ -104,7 +104,8 @@ func TestDefaultClient_RunCommandWithVersion_EnvVars(t *testing.T) {
 		"ATLANTIS_TERRAFORM_VERSION=$ATLANTIS_TERRAFORM_VERSION",
 		"DIR=$DIR",
 	}
-	out, err := client.RunCommandWithVersion(nil, tmp, args, map[string]string{}, nil, "workspace")
+
+	out, err := client.RunCommandWithVersion(models.ProjectCommandContext{Workspace: "workspace"}, tmp, args, map[string]string{}, nil)
 	Ok(t, err)
 	exp := fmt.Sprintf("TF_IN_AUTOMATION=true TF_PLUGIN_CACHE_DIR=%s WORKSPACE=workspace ATLANTIS_TERRAFORM_VERSION=0.11.11 DIR=%s\n", tmp, tmp)
 	Equals(t, exp, out)
@@ -129,10 +130,59 @@ func TestDefaultClient_RunCommandWithVersion_Error(t *testing.T) {
 		"1",
 	}
 	log := logging.NewSimpleLogger("test", false, logging.Debug)
-	out, err := client.RunCommandWithVersion(log, tmp, args, map[string]string{}, nil, "workspace")
+	out, err := client.RunCommandWithVersion(models.ProjectCommandContext{Log: log}, tmp, args, map[string]string{}, nil)
 	ErrEquals(t, fmt.Sprintf(`running "echo dying && exit 1" in %q: exit status 1`, tmp), err)
 	// Test that we still get our output.
 	Equals(t, "dying\n", out)
+}
+
+func TestDefaultClient_RunCommandWithVersion_OutputCmdDir(t *testing.T) {
+	v, err := version.NewVersion("0.11.11")
+	Ok(t, err)
+
+	tmp, cleanup := TempDir(t)
+	defer cleanup()
+
+	client := &DefaultClient{
+		outputCmdDir: tmp,
+		overrideTF:   "echo",
+	}
+
+	echoValue := "test123"
+	args := []string{echoValue}
+
+	log := logging.NewSimpleLogger("test", false, logging.Debug)
+	ctx := models.ProjectCommandContext{
+		Log: log,
+		Pull: models.PullRequest{
+			Num:        1,
+			HeadCommit: "1aa2b3c4",
+		},
+	}
+	output, err := client.RunCommandWithVersion(ctx, tmp, args, map[string]string{}, v)
+	Ok(t, err)
+
+	exp := fmt.Sprintf("%s\n", echoValue)
+	Equals(t, exp, output)
+
+	isOutputFileFound := false
+	err = filepath.Walk(tmp, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			outputFile, err := os.Open(path)
+			Ok(t, err)
+
+			b, err := ioutil.ReadAll(outputFile)
+			Ok(t, err)
+
+			Equals(t, exp, string(b))
+
+			isOutputFileFound = true
+		}
+
+		return nil
+	})
+
+	Equals(t, isOutputFileFound, true)
 }
 
 func TestDefaultClient_RunCommandAsync_Success(t *testing.T) {

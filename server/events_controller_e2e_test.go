@@ -418,7 +418,7 @@ func setupE2E(t *testing.T, repoDir string) (server.EventsController, *vcsmocks.
 		GithubUser: "github-user",
 		GitlabUser: "gitlab-user",
 	}
-	terraformClient, err := terraform.NewClient(logger, dataDir, "", "", "", "default-tf-version", "https://releases.hashicorp.com", &NoopTFDownloader{}, false)
+	terraformClient, err := terraform.NewClient(logger, dataDir, "", "", "", "default-tf-version", "https://releases.hashicorp.com", &NoopTFDownloader{}, false, "")
 	Ok(t, err)
 	boltdb, err := db.New(dataDir)
 	Ok(t, err)
@@ -442,6 +442,15 @@ func setupE2E(t *testing.T, repoDir string) (server.EventsController, *vcsmocks.
 		Ok(t, err)
 	}
 	drainer := &events.Drainer{}
+	preWorkflowHooksCommandRunner := &events.DefaultPreWorkflowHooksCommandRunner{
+		VCSClient:             e2eVCSClient,
+		GlobalCfg:             globalCfg,
+		Logger:                logger,
+		WorkingDirLocker:      locker,
+		WorkingDir:            workingDir,
+		Drainer:               drainer,
+		PreWorkflowHookRunner: &runtime.PreWorkflowHookRunner{},
+	}
 	commandRunner := &events.DefaultCommandRunner{
 		ProjectCommandRunner: &events.DefaultProjectCommandRunner{
 			Locker:           projectLocker,
@@ -497,8 +506,9 @@ func setupE2E(t *testing.T, repoDir string) (server.EventsController, *vcsmocks.
 	Ok(t, err)
 
 	ctrl := server.EventsController{
-		TestingMode:   true,
-		CommandRunner: commandRunner,
+		TestingMode:                   true,
+		PreWorkflowHooksCommandRunner: preWorkflowHooksCommandRunner,
+		CommandRunner:                 commandRunner,
 		PullCleaner: &events.PullClosedExecutor{
 			Locker:     lockingClient,
 			VCSClient:  e2eVCSClient,
